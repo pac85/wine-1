@@ -440,8 +440,6 @@ static VkResult X11DRV_vkAcquireNextImageKHR(VkDevice device,
         VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore,
         VkFence fence, uint32_t *image_index)
 {
-    static int once;
-    struct x11drv_escape_present_drawable escape;
     struct wine_vk_surface *surface = NULL;
     DWORD dc_flags = DCX_USESTYLE;
     VkResult result;
@@ -509,15 +507,6 @@ static VkResult X11DRV_vkAcquireNextImageKHR(VkDevice device,
             {
                 set_dc_drawable( hdc, surface->window, &rect );
             }
-        }
-        else
-        {
-            escape.code = X11DRV_PRESENT_DRAWABLE;
-            escape.drawable = surface->window;
-            escape.flush = TRUE;
-            ExtEscape(hdc, X11DRV_ESCAPE, sizeof(escape), (char *)&escape, 0, NULL);
-            if (surface->present_mode == VK_PRESENT_MODE_MAILBOX_KHR)
-                if (once++) FIXME("Application requires child window rendering with mailbox present mode, expect possible tearing!\n");
         }
         ReleaseDC(surface->hwnd, hdc);
     }
@@ -1022,11 +1011,50 @@ static VkResult X11DRV_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *
 {
     static SRWLOCK lock = SRWLOCK_INIT;
     VkResult res;
+    DWORD dc_flags = DCX_USESTYLE;
+    VkSwapchainKHR swapchain;
+
+    static int once;
+    struct x11drv_escape_present_drawable escape;
+    struct wine_vk_surface *surface = NULL;
+    VkFence orig_fence;
+    BOOL wait_fence = FALSE;
+    HDC hdc = 0;
 
     TRACE("%p, %p\n", queue, present_info);
 
     AcquireSRWLockExclusive( &lock );
     res = pvkQueuePresentKHR(queue, present_info);
+
+    if(res == VK_SUCCESS)
+    {
+        for(uint32_t i = 0; i < present_info->swapchainCount; i++)
+        {
+            swapchain = present_info->pSwapchains[i];
+
+            EnterCriticalSection(&context_section);
+            if (!XFindContext(gdi_display, (XID)swapchain, vulkan_swapchain_context, (char **)&surface))
+            {
+                wine_vk_surface_grab(surface);
+                if (!surface->gdi_blit_source || surface->other_process)
+                    dc_flags |= DCX_CACHE;
+                hdc = GetDCEx(surface->hwnd, 0, dc_flags);
+
+            }
+            LeaveCriticalSection(&context_section);
+
+            if (hdc && surface && surface->offscreen)
+            {
+                escape.code = X11DRV_PRESENT_DRAWABLE;
+                escape.drawable = surface->window;
+                escape.flush = TRUE;
+
+                ExtEscape(hdc, X11DRV_ESCAPE, sizeof(escape), (char *)&escape, 0, NULL);
+                if (surface->present_mode == VK_PRESENT_MODE_MAILBOX_KHR)
+                    if (once++) FIXME("Application requires child window rendering with mailbox present mode, expect possible tearing!\n");
+            }
+        }
+    }
     ReleaseSRWLockExclusive( &lock );
 
     if (TRACE_ON(fps))
